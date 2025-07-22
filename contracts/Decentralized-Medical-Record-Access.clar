@@ -34,6 +34,18 @@
   }
 )
 
+(define-map audit-log
+  {patient: principal, log-id: uint}
+  {
+    provider: principal,
+    action: (string-ascii 50),
+    timestamp: uint,
+    success: bool
+  }
+)
+
+(define-data-var next-log-id uint u1)
+
 ;; Read-only functions
 (define-read-only (get-patient-record (patient principal))
   (match (map-get? patient-records patient)
@@ -55,6 +67,35 @@
     ERR-NOT-FOUND
   )
 )
+
+(define-read-only (get-audit-entry (patient principal) (log-id uint))
+  (map-get? audit-log {patient: patient, log-id: log-id}))
+
+(define-read-only (get-latest-audit-entries (patient principal) (count uint))
+  (let ((current-id (var-get next-log-id)))
+    (if (> current-id count)
+      (fold append-audit-entry (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list))
+      (list))))
+
+(define-private (append-audit-entry (offset uint) (acc (list 10 (optional {provider: principal, action: (string-ascii 50), timestamp: uint, success: bool}))))
+  (let ((current-id (var-get next-log-id)))
+    (if (> current-id offset)
+      (unwrap-panic (as-max-len? (append acc (map-get? audit-log {patient: tx-sender, log-id: (- current-id offset)})) u10))
+      acc)))
+
+(define-private (log-audit-event (patient principal) (provider principal) (action (string-ascii 50)) (success bool))
+  (let ((log-id (var-get next-log-id)))
+    (begin
+      (map-set audit-log 
+        {patient: patient, log-id: log-id}
+        {
+          provider: provider,
+          action: action,
+          timestamp: stacks-block-height,
+          success: success
+        })
+      (var-set next-log-id (+ log-id u1))
+      log-id)))
 
 ;; Write functions
 (define-public (add-medical-record (encrypted-data (string-utf8 500)))
@@ -86,7 +127,8 @@
     (asserts! (is-some (map-get? provider-registry provider)) ERR-NOT-AUTHORIZED)
     (let ((provider-info (unwrap-panic (map-get? provider-registry provider))))
       (asserts! (get active provider-info) ERR-NOT-AUTHORIZED)
-      (asserts! (> expires-at stacks-block-height) (err u105)) ;; define your own ERR-INVALID-EXPIRATION
+      (asserts! (> expires-at stacks-block-height) (err u105))
+      (log-audit-event tx-sender provider "grant-access" true)
       (ok (map-set access-grants 
         {patient: tx-sender, provider: provider}
         {
@@ -100,8 +142,9 @@
 
 
 (define-public (revoke-access (provider principal))
-  (ok (map-delete access-grants {patient: tx-sender, provider: provider}))
-)
+  (begin
+    (log-audit-event tx-sender provider "revoke-access" true)
+    (ok (map-delete access-grants {patient: tx-sender, provider: provider}))))
 
 (define-public (register-provider (name (string-utf8 100)) (license (string-utf8 50)))
   (begin
