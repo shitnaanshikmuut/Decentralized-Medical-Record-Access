@@ -2,6 +2,7 @@
 (define-constant ERR-NOT-AUTHORIZED (err u100))
 (define-constant ERR-ALREADY-EXISTS (err u102))
 (define-constant ERR-NOT-FOUND (err u103))
+(define-constant ERR-INVALID-DURATION (err u104))
 
 ;; Admin variable
 (define-data-var admin principal tx-sender)
@@ -44,7 +45,17 @@
   }
 )
 
+(define-map emergency-access
+  {patient: principal, provider: principal}
+  {
+    granted-at: uint,
+    expires-at: uint,
+    justification: (string-utf8 200)
+  }
+)
+
 (define-data-var next-log-id uint u1)
+(define-data-var emergency-duration uint u144)
 
 ;; Read-only functions
 (define-read-only (get-patient-record (patient principal))
@@ -70,6 +81,16 @@
 
 (define-read-only (get-audit-entry (patient principal) (log-id uint))
   (map-get? audit-log {patient: patient, log-id: log-id}))
+
+(define-read-only (check-emergency-access (provider principal) (patient principal))
+  (match (map-get? emergency-access {patient: patient, provider: provider})
+    grant (if (> (get expires-at grant) stacks-block-height)
+            (ok grant)
+            ERR-NOT-AUTHORIZED)
+    ERR-NOT-AUTHORIZED))
+
+(define-read-only (get-emergency-duration)
+  (var-get emergency-duration))
 
 (define-read-only (get-latest-audit-entries (patient principal) (count uint))
   (let ((current-id (var-get next-log-id)))
@@ -177,8 +198,36 @@
 (define-public (transfer-admin (new-admin principal))
   (begin
     (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
-    (asserts! (not (is-eq new-admin tx-sender)) (err u107)) ;; prevent transferring to self
+    (asserts! (not (is-eq new-admin tx-sender)) (err u107))
     (ok (var-set admin new-admin))
   )
 )
+
+(define-public (request-emergency-access (patient principal) (justification (string-utf8 200)))
+  (begin
+    (asserts! (is-some (map-get? provider-registry tx-sender)) ERR-NOT-AUTHORIZED)
+    (let ((provider-info (unwrap-panic (map-get? provider-registry tx-sender))))
+      (asserts! (get active provider-info) ERR-NOT-AUTHORIZED)
+      (asserts! (is-none (map-get? emergency-access {patient: patient, provider: tx-sender})) ERR-ALREADY-EXISTS)
+      (let ((expires-at (+ stacks-block-height (var-get emergency-duration))))
+        (log-audit-event patient tx-sender "emergency-access-requested" true)
+        (ok (map-set emergency-access 
+          {patient: patient, provider: tx-sender}
+          {
+            granted-at: stacks-block-height,
+            expires-at: expires-at,
+            justification: justification
+          }))))))
+
+(define-public (revoke-emergency-access (provider principal))
+  (begin
+    (asserts! (is-some (map-get? emergency-access {patient: tx-sender, provider: provider})) ERR-NOT-FOUND)
+    (log-audit-event tx-sender provider "emergency-access-revoked" true)
+    (ok (map-delete emergency-access {patient: tx-sender, provider: provider}))))
+
+(define-public (set-emergency-duration (new-duration uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-duration u1) (<= new-duration u2016)) ERR-INVALID-DURATION)
+    (ok (var-set emergency-duration new-duration))))
 ;;
