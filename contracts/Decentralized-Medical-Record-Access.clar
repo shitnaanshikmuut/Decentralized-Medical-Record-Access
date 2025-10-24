@@ -3,6 +3,8 @@
 (define-constant ERR-ALREADY-EXISTS (err u102))
 (define-constant ERR-NOT-FOUND (err u103))
 (define-constant ERR-INVALID-DURATION (err u104))
+(define-constant ERR-DELEGATION-EXISTS (err u108))
+(define-constant ERR-NOT-DELEGATE (err u109))
 
 ;; Admin variable
 (define-data-var admin principal tx-sender)
@@ -54,6 +56,17 @@
   }
 )
 
+(define-map delegations
+  {patient: principal, delegate: principal}
+  {
+    granted-at: uint,
+    expires-at: uint,
+    can-grant: bool,
+    can-revoke: bool,
+    active: bool
+  }
+)
+
 (define-data-var next-log-id uint u1)
 (define-data-var emergency-duration uint u144)
 
@@ -91,6 +104,16 @@
 
 (define-read-only (get-emergency-duration)
   (var-get emergency-duration))
+
+(define-read-only (get-delegation (patient principal) (delegate principal))
+  (match (map-get? delegations {patient: patient, delegate: delegate})
+    delegation (ok delegation)
+    ERR-NOT-FOUND))
+
+(define-read-only (is-valid-delegate (patient principal) (delegate principal))
+  (match (map-get? delegations {patient: patient, delegate: delegate})
+    delegation (ok (and (get active delegation) (> (get expires-at delegation) stacks-block-height)))
+    (ok false)))
 
 (define-read-only (get-latest-audit-entries (patient principal) (count uint))
   (let ((current-id (var-get next-log-id)))
@@ -161,11 +184,42 @@
   )
 )
 
+(define-public (grant-access-as-delegate (patient principal) (provider principal) (expires-at uint) (access-level uint))
+  (begin
+    (asserts! (is-some (map-get? provider-registry provider)) ERR-NOT-AUTHORIZED)
+    (let ((provider-info (unwrap-panic (map-get? provider-registry provider)))
+          (delegation (unwrap! (map-get? delegations {patient: patient, delegate: tx-sender}) ERR-NOT-DELEGATE)))
+      (asserts! (get active provider-info) ERR-NOT-AUTHORIZED)
+      (asserts! (get active delegation) ERR-NOT-DELEGATE)
+      (asserts! (get can-grant delegation) ERR-NOT-AUTHORIZED)
+      (asserts! (> (get expires-at delegation) stacks-block-height) ERR-NOT-DELEGATE)
+      (asserts! (> expires-at stacks-block-height) (err u105))
+      (log-audit-event patient tx-sender "delegate-grant-access" true)
+      (ok (map-set access-grants 
+        {patient: patient, provider: provider}
+        {
+          granted-at: stacks-block-height,
+          expires-at: expires-at,
+          access-level: access-level
+        }))
+    )
+  )
+)
+
 
 (define-public (revoke-access (provider principal))
   (begin
     (log-audit-event tx-sender provider "revoke-access" true)
     (ok (map-delete access-grants {patient: tx-sender, provider: provider}))))
+
+(define-public (revoke-access-as-delegate (patient principal) (provider principal))
+  (begin
+    (let ((delegation (unwrap! (map-get? delegations {patient: patient, delegate: tx-sender}) ERR-NOT-DELEGATE)))
+      (asserts! (get active delegation) ERR-NOT-DELEGATE)
+      (asserts! (get can-revoke delegation) ERR-NOT-AUTHORIZED)
+      (asserts! (> (get expires-at delegation) stacks-block-height) ERR-NOT-DELEGATE)
+      (log-audit-event patient tx-sender "delegate-revoke-access" true)
+      (ok (map-delete access-grants {patient: patient, provider: provider})))))
 
 (define-public (register-provider (name (string-utf8 100)) (license (string-utf8 50)))
   (begin
@@ -230,4 +284,49 @@
     (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
     (asserts! (and (>= new-duration u1) (<= new-duration u2016)) ERR-INVALID-DURATION)
     (ok (var-set emergency-duration new-duration))))
+
+(define-public (add-delegate (delegate principal) (expires-at uint) (can-grant bool) (can-revoke bool))
+  (begin
+    (asserts! (not (is-eq tx-sender delegate)) (err u110))
+    (asserts! (> expires-at stacks-block-height) ERR-INVALID-DURATION)
+    (asserts! (is-none (map-get? delegations {patient: tx-sender, delegate: delegate})) ERR-DELEGATION-EXISTS)
+    (log-audit-event tx-sender delegate "delegation-granted" true)
+    (ok (map-set delegations
+      {patient: tx-sender, delegate: delegate}
+      {
+        granted-at: stacks-block-height,
+        expires-at: expires-at,
+        can-grant: can-grant,
+        can-revoke: can-revoke,
+        active: true
+      }))))
+
+(define-public (revoke-delegation (delegate principal))
+  (begin
+    (let ((delegation (unwrap! (map-get? delegations {patient: tx-sender, delegate: delegate}) ERR-NOT-FOUND)))
+      (log-audit-event tx-sender delegate "delegation-revoked" true)
+      (ok (map-set delegations
+        {patient: tx-sender, delegate: delegate}
+        {
+          granted-at: (get granted-at delegation),
+          expires-at: (get expires-at delegation),
+          can-grant: (get can-grant delegation),
+          can-revoke: (get can-revoke delegation),
+          active: false
+        })))))
+
+(define-public (update-delegation-permissions (delegate principal) (can-grant bool) (can-revoke bool))
+  (begin
+    (let ((delegation (unwrap! (map-get? delegations {patient: tx-sender, delegate: delegate}) ERR-NOT-FOUND)))
+      (asserts! (get active delegation) ERR-NOT-FOUND)
+      (log-audit-event tx-sender delegate "delegation-updated" true)
+      (ok (map-set delegations
+        {patient: tx-sender, delegate: delegate}
+        {
+          granted-at: (get granted-at delegation),
+          expires-at: (get expires-at delegation),
+          can-grant: can-grant,
+          can-revoke: can-revoke,
+          active: true
+        })))))
 ;;
