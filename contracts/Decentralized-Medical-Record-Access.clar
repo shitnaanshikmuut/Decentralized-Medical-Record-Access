@@ -69,6 +69,24 @@
 
 (define-data-var next-log-id uint u1)
 (define-data-var emergency-duration uint u144)
+(define-data-var max-versions uint u10)
+
+(define-map record-versions
+  {patient: principal, version: uint}
+  {
+    encrypted-data: (string-utf8 500),
+    timestamp: uint,
+    previous-version: uint
+  }
+)
+
+(define-map version-metadata
+  principal
+  {
+    current-version: uint,
+    total-versions: uint
+  }
+)
 
 ;; Read-only functions
 (define-read-only (get-patient-record (patient principal))
@@ -121,6 +139,21 @@
       (fold append-audit-entry (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list))
       (list))))
 
+(define-read-only (get-record-version (patient principal) (version uint))
+  (match (map-get? record-versions {patient: patient, version: version})
+    record (ok record)
+    ERR-NOT-FOUND))
+
+(define-read-only (get-version-metadata (patient principal))
+  (match (map-get? version-metadata patient)
+    metadata (ok metadata)
+    ERR-NOT-FOUND))
+
+(define-read-only (get-version-history (patient principal))
+  (match (map-get? version-metadata patient)
+    metadata (ok (get total-versions metadata))
+    (ok u0)))
+
 (define-private (append-audit-entry (offset uint) (acc (list 10 (optional {provider: principal, action: (string-ascii 50), timestamp: uint, success: bool}))))
   (let ((current-id (var-get next-log-id)))
     (if (> current-id offset)
@@ -145,23 +178,57 @@
 (define-public (add-medical-record (encrypted-data (string-utf8 500)))
   (if (is-some (map-get? patient-records tx-sender))
     ERR-ALREADY-EXISTS
-    (ok (map-set patient-records tx-sender
-      {
-        encrypted-data: encrypted-data,
-        timestamp: stacks-block-height,
-        last-updated: stacks-block-height
-      }))
+    (begin
+      (map-set patient-records tx-sender
+        {
+          encrypted-data: encrypted-data,
+          timestamp: stacks-block-height,
+          last-updated: stacks-block-height
+        })
+      (map-set record-versions
+        {patient: tx-sender, version: u1}
+        {
+          encrypted-data: encrypted-data,
+          timestamp: stacks-block-height,
+          previous-version: u0
+        })
+      (map-set version-metadata tx-sender
+        {
+          current-version: u1,
+          total-versions: u1
+        })
+      (ok true))
   )
 )
 
 (define-public (update-medical-record (encrypted-data (string-utf8 500)))
   (match (map-get? patient-records tx-sender)
-    record (ok (map-set patient-records tx-sender
-      {
-        encrypted-data: encrypted-data,
-        timestamp: (get timestamp record),
-        last-updated: stacks-block-height
-      }))
+    record 
+    (let ((metadata (unwrap! (map-get? version-metadata tx-sender) ERR-NOT-FOUND))
+          (current-ver (get current-version metadata))
+          (total-vers (get total-versions metadata))
+          (new-version (+ current-ver u1)))
+      (asserts! (<= new-version (var-get max-versions)) (err u111))
+      (map-set patient-records tx-sender
+        {
+          encrypted-data: encrypted-data,
+          timestamp: (get timestamp record),
+          last-updated: stacks-block-height
+        })
+      (map-set record-versions
+        {patient: tx-sender, version: new-version}
+        {
+          encrypted-data: encrypted-data,
+          timestamp: stacks-block-height,
+          previous-version: current-ver
+        })
+      (map-set version-metadata tx-sender
+        {
+          current-version: new-version,
+          total-versions: (+ total-vers u1)
+        })
+      (log-audit-event tx-sender tx-sender "record-version-created" true)
+      (ok true))
     ERR-NOT-FOUND
   )
 )
@@ -329,4 +396,29 @@
           can-revoke: can-revoke,
           active: true
         })))))
+
+(define-public (rollback-to-version (version uint))
+  (let ((metadata (unwrap! (map-get? version-metadata tx-sender) ERR-NOT-FOUND))
+        (version-data (unwrap! (map-get? record-versions {patient: tx-sender, version: version}) ERR-NOT-FOUND))
+        (current-record (unwrap! (map-get? patient-records tx-sender) ERR-NOT-FOUND)))
+    (asserts! (<= version (get total-versions metadata)) ERR-NOT-FOUND)
+    (map-set patient-records tx-sender
+      {
+        encrypted-data: (get encrypted-data version-data),
+        timestamp: (get timestamp current-record),
+        last-updated: stacks-block-height
+      })
+    (map-set version-metadata tx-sender
+      {
+        current-version: version,
+        total-versions: (get total-versions metadata)
+      })
+    (log-audit-event tx-sender tx-sender "record-rollback" true)
+    (ok version)))
+
+(define-public (set-max-versions (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= new-max u1) (<= new-max u50)) ERR-INVALID-DURATION)
+    (ok (var-set max-versions new-max))))
 ;;
